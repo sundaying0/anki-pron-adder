@@ -182,6 +182,78 @@ def fetch_pronunciation(word, api_key):
 
 
 # ============================================================
+# TTS 整句发音（小米 MiMo API）
+# ============================================================
+
+def fetch_tts(text, api_key):
+    """调用小米 MiMo TTS API 生成语音，返回 (filename, audio_bytes) 或 None"""
+    if not api_key or not text or not text.strip():
+        return None, None
+    # 用文本哈希作为文件名，避免重复生成
+    text_hash = hashlib.md5(text.strip().encode("utf-8")).hexdigest()[:12]
+    filename = f"tts_{text_hash}.mp3"
+    # 先检查缓存
+    cached = cache_get(f"tts_{text_hash}")
+    if cached:
+        return cached
+    url = "https://platform.xiaomimimo.com/api/v1/audio/speech"
+    payload = json.dumps({
+        "model": "tts-1",
+        "input": text.strip(),
+        "voice": "alloy",
+        "response_format": "mp3"
+    }).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
+    try:
+        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            audio_bytes = resp.read()
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+        return None, None
+    if not audio_bytes or len(audio_bytes) < 100:
+        return None, None
+    cache_put(f"tts_{text_hash}", audio_bytes)
+    return filename, audio_bytes
+
+
+def find_long_sentences(text, min_words=4):
+    """从 HTML 内容中查找较长的英文语句，返回 [(start, end, sentence_text), ...]"""
+    if not text:
+        return []
+    # 去掉 HTML 标签
+    clean = re.sub(r'<[^>]+>', ' ', text)
+    # 去掉音标 /xxx/
+    clean = re.sub(r'/[^/]{3,}/', ' ', clean)
+    # 去掉 [sound:xxx]
+    clean = re.sub(r'\[sound:[^\]]+\]', ' ', clean)
+    results = []
+    # 按行查找英文语句
+    for line in clean.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        # 提取连续英文单词序列
+        words = re.findall(r'[a-zA-Z]+', line)
+        if len(words) >= min_words:
+            sentence = ' '.join(words)
+            # 查找在原文中的位置
+            idx = text.find(words[0])
+            if idx >= 0:
+                # 从第一个单词位置向后找到最后一个单词的末尾
+                last_word_idx = text.rfind(words[-1])
+                if last_word_idx >= 0:
+                    end_pos = last_word_idx + len(words[-1])
+                    # 检查这段内容没有已有的 TTS 按钮
+                    segment = text[idx:end_pos + 50]
+                    if 'anki-tts-' not in segment:
+                        results.append((idx, end_pos, sentence))
+    return results
+
+
+# ============================================================
 # 配置管理
 # ============================================================
 
@@ -291,6 +363,8 @@ class PronDialog(QDialog):
         self.result_action = None
         # 修改模式：记录正在被替换的旧发音文件名
         self.replacing_pron = None
+        # TTS 整句发音：detected_sentences = [(start, end, text), ...]
+        self.detected_sentences = []
 
         layout = QVBoxLayout()
 
@@ -332,6 +406,26 @@ class PronDialog(QDialog):
         self.script_status_label = QLabel("")
         self.script_status_label.setWordWrap(True)
         layout.addWidget(self.script_status_label)
+
+        # TTS 整句发音
+        tts_group = QGroupBox("整句发音（小米 TTS）")
+        tts_layout = QVBoxLayout()
+        self.tts_status_label = QLabel("")
+        self.tts_status_label.setWordWrap(True)
+        tts_layout.addWidget(self.tts_status_label)
+        tts_btn_layout = QHBoxLayout()
+        gen_tts_btn = QPushButton("生成整句发音")
+        gen_tts_btn.setAutoDefault(False)
+        gen_tts_btn.clicked.connect(self.on_generate_tts)
+        tts_btn_layout.addWidget(gen_tts_btn)
+        rm_tts_btn = QPushButton("移除整句发音")
+        rm_tts_btn.setAutoDefault(False)
+        rm_tts_btn.clicked.connect(self.on_remove_tts)
+        tts_btn_layout.addWidget(rm_tts_btn)
+        tts_layout.addLayout(tts_btn_layout)
+        tts_group.setLayout(tts_layout)
+        layout.addWidget(tts_group)
+        self._detect_sentences()
 
         # 试听按钮
         self.preview_btn = QPushButton("试听")
@@ -572,6 +666,7 @@ class PronDialog(QDialog):
         self.note = mw.col.get_note(self.note.id)
         self.original_content = self.note[self.field_name]
         self.saved = True
+        self._detect_sentences()
         self.status_label.setText("已保存")
 
     def on_modify_existing(self, filename):
@@ -588,6 +683,7 @@ class PronDialog(QDialog):
         self.existing_prons = find_existing_pronunciations(content)
         self._render_existing_prons()
         self._check_script_status()
+        self._detect_sentences()
         self.status_label.setText(f"已刷新，共 {len(self.existing_prons)} 个发音")
 
     def _check_script_status(self):
@@ -672,6 +768,87 @@ class PronDialog(QDialog):
         self.note[field] = content
         self._check_script_status()
         self.status_label.setText("已修复脚本")
+
+    def _detect_sentences(self):
+        """检测当前字段中的长英文语句"""
+        field = self.field_combo.currentText()
+        content = self.note.get(field, "")
+        self.detected_sentences = find_long_sentences(content)
+        # 同时检测已有 TTS 按钮
+        existing_tts = re.findall(r'anki-tts-[a-f0-9]+', content)
+        if self.detected_sentences:
+            msg = f"检测到 {len(self.detected_sentences)} 个可添加整句发音的语句"
+            if existing_tts:
+                msg += f"，已有 {len(set(existing_tts))} 个整句发音"
+            self.tts_status_label.setText(msg)
+        elif existing_tts:
+            self.tts_status_label.setText(f"已有 {len(set(existing_tts))} 个整句发音")
+        else:
+            self.tts_status_label.setText("未检测到可添加整句发音的长语句")
+
+    def on_generate_tts(self):
+        """为检测到的长语句生成整句发音"""
+        config = get_config()
+        xiaomi_key = config.get("xiaomi_api_key", "")
+        if not xiaomi_key:
+            self.tts_status_label.setText("未配置小米 API Key，请在插件设置中配置")
+            return
+        if not self.detected_sentences:
+            self._detect_sentences()
+            if not self.detected_sentences:
+                self.tts_status_label.setText("没有可添加整句发音的语句")
+                return
+        field = self.field_combo.currentText()
+        content = self.note[field]
+        media_dir = mw.col.media.dir()
+        added = 0
+        total = len(self.detected_sentences)
+        tts_btn_style = (
+            "background:#e8f5e9;border:1px solid #4caf50;border-radius:3px;"
+            "padding:2px 6px;cursor:pointer;font-size:12px;margin-left:4px;"
+        )
+        # 逆序处理，避免位置偏移
+        for idx, end_pos, sentence in reversed(self.detected_sentences):
+            self.tts_status_label.setText(f"正在生成 {total - idx}/{total}...")
+            QApplication.processEvents()
+            filename, audio_bytes = fetch_tts(sentence, xiaomi_key)
+            if filename and audio_bytes:
+                # 写入媒体库
+                filepath = os.path.join(media_dir, filename)
+                if not os.path.exists(filepath):
+                    with open(filepath, "wb") as f:
+                        f.write(audio_bytes)
+                # 在语句末尾插入播放按钮
+                tts_id = filename.replace(".mp3", "")
+                tts_btn = (
+                    f'<button id="{tts_id}" style="{tts_btn_style}" '
+                    f'onclick="var a=new Audio(\'{filename}\');a.volume='
+                    f"+(localStorage.getItem('anki-sender-vol')||'0.8');"
+                    f'a.play();">🔊 整句</button>'
+                )
+                content = content[:end_pos] + tts_btn + content[end_pos:]
+                added += 1
+        self.note[field] = content
+        self._detect_sentences()
+        if added:
+            self.tts_status_label.setText(f"已生成 {added} 个整句发音")
+        else:
+            self.tts_status_label.setText("生成失败，请检查小米 API Key")
+
+    def on_remove_tts(self):
+        """移除所有整句发音按钮"""
+        field = self.field_combo.currentText()
+        content = self.note[field]
+        # 移除所有 anki-tts-xxx 按钮
+        pattern = re.compile(r'<button[^>]*id="anki-tts-[^"]*"[^>]*>.*?</button>', re.DOTALL)
+        new_content = pattern.sub('', content)
+        removed = content.count('anki-tts-') // 2  # 粗略计算
+        self.note[field] = new_content.strip()
+        self._detect_sentences()
+        if removed:
+            self.tts_status_label.setText(f"已移除整句发音")
+        else:
+            self.tts_status_label.setText("没有可移除的整句发音")
 
 
 # ============================================================
@@ -941,6 +1118,15 @@ class SettingsDialog(QDialog):
         import_btn.clicked.connect(self.import_from_obsidian)
         layout.addWidget(import_btn)
 
+        xiaomi_group = QGroupBox("小米 MiMo API Key（整句发音）")
+        xiaomi_layout = QHBoxLayout()
+        self.xiaomi_input = QLineEdit(config.get("xiaomi_api_key", ""))
+        self.xiaomi_input.setPlaceholderText("platform.xiaomimimo.com 获取")
+        xiaomi_layout.addWidget(QLabel("API Key："))
+        xiaomi_layout.addWidget(self.xiaomi_input)
+        xiaomi_group.setLayout(xiaomi_layout)
+        layout.addWidget(xiaomi_group)
+
         field_group = QGroupBox("默认设置")
         field_layout = QFormLayout()
         self.field_input = QLineEdit(config.get("target_field", "引用"))
@@ -986,6 +1172,7 @@ class SettingsDialog(QDialog):
     def on_save(self):
         config = get_config()
         config["api_key"] = self.api_input.text().strip()
+        config["xiaomi_api_key"] = self.xiaomi_input.text().strip()
         config["target_field"] = self.field_input.text().strip() or "引用"
         config["shortcut"] = self.shortcut_input.text().strip() or "Ctrl+Shift+F"
         write_config(config)
