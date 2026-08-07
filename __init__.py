@@ -1,0 +1,1075 @@
+"""
+Anki 发音补丁插件
+选中卡片 → 快捷键/菜单 → 弹窗输入单词 → 下载美式发音 → 嵌入 HTML 播放按钮
+"""
+import os
+import re
+import json
+import urllib.request
+import urllib.error
+import urllib.parse
+import concurrent.futures
+import hashlib
+
+from aqt import mw
+from aqt.qt import *
+from aqt import utils
+from aqt import gui_hooks
+try:
+    from aqt import dialogs
+except ImportError:
+    dialogs = None
+
+
+
+# ============================================================
+# 本地缓存
+# ============================================================
+
+_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".anki-pron-cache")
+
+
+def _ensure_cache_dir():
+    if not os.path.exists(_CACHE_DIR):
+        os.makedirs(_CACHE_DIR, exist_ok=True)
+
+
+def cache_get(word):
+    """从缓存读取音频，返回 (filename, audio_bytes) 或 None"""
+    _ensure_cache_dir()
+    filepath = os.path.join(_CACHE_DIR, f"{word}.mp3")
+    if os.path.exists(filepath):
+        with open(filepath, "rb") as f:
+            return f"{word}.mp3", f.read()
+    return None
+
+
+def cache_put(word, audio_bytes):
+    """将音频写入缓存"""
+    _ensure_cache_dir()
+    filepath = os.path.join(_CACHE_DIR, f"{word}.mp3")
+    with open(filepath, "wb") as f:
+        f.write(audio_bytes)
+
+
+# ============================================================
+# 单词提取（从 word_extractor.py 合并）
+# ============================================================
+
+_PATTERN_PHONETIC = re.compile(
+    r'([a-zA-Z]+)'
+    r'(?:\s+|\s*\|\s*)'
+    r'/[^/]{3,}/?'
+)
+_PATTERN_PURE_WORD = re.compile(r'^[a-zA-Z]{2,}$')
+_PATTERN_SOUND = re.compile(r'\[sound:([^\]]+)\]')
+# 匹配 HTML 按钮中的文件名：id="anki-play-xxx" 或 new Audio('xxx.mp3')
+_PATTERN_HTML_BTN = re.compile(r"anki-play-([a-zA-Z0-9_-]+)")
+
+
+def extract_word(text):
+    if not text:
+        return None
+    cleaned = re.sub(r'<[^>]+>', '', text)
+    cleaned = cleaned.replace('**', '').replace('*', '').strip()
+    if not cleaned:
+        return None
+    m = _PATTERN_PHONETIC.search(cleaned)
+    if m:
+        return m.group(1)
+    lines = [l.strip() for l in cleaned.split('\n') if l.strip()]
+    if lines:
+        first_line = lines[0]
+        first_line = re.sub(r'^[-*]\s+', '', first_line)
+        first_line = re.sub(r'^\d+\.\s*', '', first_line)
+        first_line = first_line.strip()
+        if _PATTERN_PURE_WORD.match(first_line):
+            return first_line
+    return None
+
+
+def find_existing_pronunciations(text):
+    """查找字段中已有的发音标记（支持 [sound:] 和 HTML 按钮两种格式）"""
+    if not text:
+        return []
+    results = []
+    # [sound:xxx.mp3] 格式
+    for m in _PATTERN_SOUND.findall(text):
+        if m not in results:
+            results.append(m)
+    # HTML 按钮格式 anki-play-xxx
+    for m in _PATTERN_HTML_BTN.findall(text):
+        filename = m + ".mp3"
+        if filename not in results:
+            results.append(filename)
+    return results
+
+
+def remove_pronunciation(text, filename):
+    """移除发音标记（支持 [sound:] 和 HTML 按钮两种格式）"""
+    word = filename.replace(".mp3", "")
+    # 移除 [sound:xxx.mp3]
+    pattern_sound = re.compile(r'\s?\[sound:' + re.escape(filename) + r'\]\s?')
+    text = pattern_sound.sub(' ', text)
+    # 移除特定按钮（只删除这个单词的按钮，保留其他）
+    pattern_btn = re.compile(
+        r'<button[^>]*id="anki-play-' + re.escape(word) + r'"[^>]*>.*?</button>',
+        re.DOTALL
+    )
+    text = pattern_btn.sub('', text)
+    # 如果没有剩余按钮了，移除整个容器和脚本
+    if 'anki-play-' not in text:
+        pattern_container = re.compile(
+            r'<div\s+style="margin-top:\s*8px;">.*?</div>',
+            re.DOTALL
+        )
+        text = pattern_container.sub('', text)
+        pattern_script = re.compile(r'<script>[^<]*anki-play-[^<]*</script>', re.DOTALL)
+        text = pattern_script.sub('', text)
+    # 合并多余空行
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+# ============================================================
+# MW API 发音获取（从 pron_fetcher.py 合并）
+# ============================================================
+
+def fetch_pronunciation(word, api_key):
+    if not api_key or not word:
+        return None, None
+    # 先检查缓存
+    cached = cache_get(word)
+    if cached:
+        return cached
+    # 缓存未命中，调用 API
+    url = (
+        f"https://www.dictionaryapi.com/api/v3/references/collegiate/json/"
+        f"{urllib.parse.quote(word)}?key={api_key}"
+    )
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, json.JSONDecodeError, OSError):
+        return None, None
+    if not isinstance(data, list) or not data:
+        return None, None
+    if isinstance(data[0], str):
+        return None, None
+    try:
+        sound = data[0]["hwi"]["prs"][0]["sound"]
+    except (KeyError, IndexError):
+        return None, None
+    audio_name = sound.get("audio")
+    if not audio_name:
+        return None, None
+    first_letter = audio_name[0]
+    audio_url = (
+        f"https://media.merriam-webster.com/audio/prons/en/us/wav/"
+        f"{first_letter}/{audio_name}.wav"
+    )
+    try:
+        req = urllib.request.Request(audio_url)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            audio_bytes = resp.read()
+    except (urllib.error.URLError, OSError):
+        return None, None
+    filename = f"{word}.mp3"
+    # 写入缓存
+    cache_put(word, audio_bytes)
+    return filename, audio_bytes
+
+
+# ============================================================
+# 配置管理
+# ============================================================
+
+def get_config():
+    try:
+        return mw.addonManager.getConfig(__name__) or {}
+    except Exception:
+        return {}
+
+
+def write_config(config):
+    try:
+        mw.addonManager.writeConfig(__name__, config)
+    except Exception:
+        pass
+
+
+# ============================================================
+# 音频播放
+# ============================================================
+
+def play_audio_file(filename):
+    media_dir = mw.col.media.dir()
+    filepath = os.path.join(media_dir, filename)
+    if not os.path.exists(filepath):
+        utils.tooltip("文件不存在: " + filename)
+        return
+    try:
+        from aqt.sound import av_player
+        av_player.play_file(filepath)
+    except ImportError:
+        from anki.sound import play
+        play(filepath)
+
+
+def check_audio_exists(filename):
+    """检查音频文件是否存在于 Anki 媒体库"""
+    media_dir = mw.col.media.dir()
+    filepath = os.path.join(media_dir, filename)
+    return os.path.exists(filepath)
+
+
+def build_pronunciation_html(entries):
+    """
+    构建发音按钮 HTML，与 anki-sender 风格完全一致。
+    entries: [(word, filename), ...] 支持多个单词
+    所有按钮共享一个音量滑块。
+    """
+    btn_style = (
+        "background:#f0f0f0;border:1px solid #ccc;border-radius:4px;"
+        "padding:4px 12px;cursor:pointer;font-size:14px;margin-right:6px;"
+    )
+    buttons = ""
+    for word, filename in entries:
+        buttons += (
+            f'<button id="anki-play-{word}" style="{btn_style}">'
+            f'🔊 {word}</button>'
+        )
+    # 共享音量滑块（只一个）
+    volume_bar = (
+        '<span style="margin-left:8px;font-size:13px;color:#888;">🔈</span>'
+        '<input id="anki-vol" type="range" min="0" max="100" value="80" '
+        'style="width:80px;vertical-align:middle;">'
+        '<span id="anki-vol-val" style="font-size:12px;color:#888;">0.8</span>'
+    )
+    # 播放脚本（带 DOM 加载检测，防止执行时机问题）
+    script = (
+        '<script>'
+        '(function(){'
+        'function init(){'
+        "var v=+(localStorage.getItem('anki-sender-vol')||'0.8');"
+        'var sl=document.getElementById(\'anki-vol\');'
+        'var lb=document.getElementById(\'anki-vol-val\');'
+        "if(sl){sl.value=Math.round(v*100);lb.textContent=v.toFixed(1);"
+        "sl.oninput=function(){v=this.value/100;lb.textContent=v.toFixed(1);"
+        "localStorage.setItem('anki-sender-vol',v);};}"
+        "document.querySelectorAll('[id^=anki-play-]').forEach(function(b){"
+        "b.onclick=function(){var a=new Audio(this.id.replace('anki-play-','')+'.mp3');a.volume=v;a.play();};});"
+        '}'
+        "if(document.readyState==='loading'){"
+        "document.addEventListener('DOMContentLoaded',init);"
+        '}else{'
+        'init();'
+        '}'
+        '})();'
+        '</script>'
+    )
+    return f'<div style="margin-top:8px;">{buttons}{volume_bar}{script}</div>'
+
+
+# ============================================================
+# 发音添加弹窗
+# ============================================================
+
+class PronDialog(QDialog):
+    def __init__(self, parent, detected_word, existing_prons, note, field_name):
+        super().__init__(parent)
+        self.setWindowTitle("添加发音")
+        self.setMinimumWidth(520)
+        self.note = note
+        self.field_name = field_name
+        self.original_content = note[field_name]  # 备份原始内容
+        self.saved = False  # 是否已保存到数据库
+        self.existing_prons = list(existing_prons)
+        # 多单词支持：results = [(word, filename, audio_bytes), ...]
+        self.results = []
+        self.result_action = None
+        # 修改模式：记录正在被替换的旧发音文件名
+        self.replacing_pron = None
+
+        layout = QVBoxLayout()
+
+        # 单词输入（支持空格分隔多个单词）
+        word_group = QGroupBox("单词")
+        word_layout = QHBoxLayout()
+        self.word_input = QLineEdit(detected_word or "")
+        self.word_input.setPlaceholderText("输入单词，多个用空格分隔，如 proceed process")
+        self.word_input.returnPressed.connect(self.on_fetch)
+        word_layout.addWidget(QLabel("单词："))
+        word_layout.addWidget(self.word_input)
+        word_group.setLayout(word_layout)
+        layout.addWidget(word_group)
+
+        # 已有发音
+        self.exist_group = QGroupBox("已有发音")
+        self.exist_layout = QVBoxLayout()
+        self._render_existing_prons()
+        self.exist_group.setLayout(self.exist_layout)
+        layout.addWidget(self.exist_group)
+
+        # 目标字段
+        field_group = QGroupBox("目标字段")
+        field_layout = QHBoxLayout()
+        self.field_combo = QComboBox()
+        self.field_combo.addItems(note.keys())
+        self.field_combo.setCurrentText(field_name)
+        field_layout.addWidget(QLabel("写入字段："))
+        field_layout.addWidget(self.field_combo)
+        field_group.setLayout(field_layout)
+        layout.addWidget(field_group)
+
+        # 状态提示
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        # 脚本状态检测
+        self.script_status_label = QLabel("")
+        self.script_status_label.setWordWrap(True)
+        layout.addWidget(self.script_status_label)
+
+        # 试听按钮
+        self.preview_btn = QPushButton("试听")
+        self.preview_btn.setEnabled(False)
+        self.preview_btn.clicked.connect(self.on_preview)
+        layout.addWidget(self.preview_btn)
+
+        # 按钮行
+        btn_layout = QHBoxLayout()
+        fetch_btn = QPushButton("查询发音")
+        fetch_btn.clicked.connect(self.on_fetch)
+        btn_layout.addWidget(fetch_btn)
+        self.fix_script_btn = QPushButton("修复脚本")
+        self.fix_script_btn.clicked.connect(self.on_fix_script)
+        btn_layout.addWidget(self.fix_script_btn)
+        btn_layout.addStretch()
+        refresh_btn = QPushButton("刷新")
+        refresh_btn.clicked.connect(self.on_refresh)
+        btn_layout.addWidget(refresh_btn)
+        save_btn = QPushButton("保存")
+        save_btn.clicked.connect(self.on_save_only)
+        btn_layout.addWidget(save_btn)
+        add_btn = QPushButton("添加发音")
+        add_btn.clicked.connect(self.on_add)
+        btn_layout.addWidget(add_btn)
+        layout.addLayout(btn_layout)
+
+        self.setLayout(layout)
+
+        # 检测脚本状态（在 fix_script_btn 创建后）
+        self._check_script_status()
+
+        # 延迟设置焦点，等对话框完全渲染后再设置
+        QTimer.singleShot(100, self.word_input.setFocus)
+
+    def closeEvent(self, event):
+        """关闭窗口：如果未保存，恢复原始内容"""
+        if not self.saved:
+            self.note[self.field_name] = self.original_content
+        event.accept()
+
+    def _render_existing_prons(self):
+        while self.exist_layout.count():
+            item = self.exist_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+            elif item.layout():
+                while item.layout().count():
+                    sub = item.layout().takeAt(0)
+                    if sub.widget():
+                        sub.widget().deleteLater()
+        if not self.existing_prons:
+            self.exist_group.setVisible(False)
+            return
+        self.exist_group.setVisible(True)
+        for pr in self.existing_prons:
+            row = QHBoxLayout()
+            # 检查音频文件是否存在
+            exists = check_audio_exists(pr)
+            if exists:
+                status_label = QLabel("  ✅")
+                status_label.setToolTip("音频文件正常")
+            else:
+                status_label = QLabel("  ❌")
+                status_label.setToolTip("音频文件缺失")
+            row.addWidget(status_label)
+            row.addWidget(QLabel(f"  {pr}"))
+            if not exists:
+                repair_btn = QPushButton("修复")
+                repair_btn.setMinimumWidth(50)
+                repair_btn.setMaximumWidth(80)
+                repair_btn.setAutoDefault(False)
+                repair_btn.clicked.connect(lambda _, p=pr: self.on_repair_existing(p))
+                row.addWidget(repair_btn)
+            mod_btn = QPushButton("修改")
+            mod_btn.setMinimumWidth(50)
+            mod_btn.setMaximumWidth(80)
+            mod_btn.setAutoDefault(False)
+            mod_btn.clicked.connect(lambda _, p=pr: self.on_modify_existing(p))
+            row.addWidget(mod_btn)
+            del_btn = QPushButton("删除")
+            del_btn.setMinimumWidth(50)
+            del_btn.setMaximumWidth(80)
+            del_btn.setAutoDefault(False)
+            del_btn.clicked.connect(lambda _, p=pr: self.on_delete_existing(p))
+            row.addWidget(del_btn)
+            self.exist_layout.addLayout(row)
+
+    def on_fetch(self):
+        text = self.word_input.text().strip()
+        if not text:
+            self.status_label.setText("请输入单词")
+            return
+        config = get_config()
+        api_key = config.get("api_key", "")
+        if not api_key:
+            self.status_label.setText("未配置 API Key，请在插件设置中配置")
+            return
+        # 按空格分割，支持多个单词
+        words = [w.strip() for w in text.split() if w.strip()]
+        if not words:
+            self.status_label.setText("请输入单词")
+            return
+        self.results = []
+        failed_words = []
+        total = len(words)
+        self.status_label.setText(f"正在查询 0/{total}...")
+        QApplication.processEvents()
+        # 并行查询
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            future_to_word = {
+                executor.submit(fetch_pronunciation, w, api_key): w
+                for w in words
+            }
+            done_count = 0
+            for future in concurrent.futures.as_completed(future_to_word):
+                word = future_to_word[future]
+                done_count += 1
+                self.status_label.setText(f"正在查询 {done_count}/{total}...")
+                QApplication.processEvents()
+                try:
+                    filename, audio_bytes = future.result()
+                    if filename:
+                        self.results.append((word, filename, audio_bytes))
+                    else:
+                        failed_words.append(word)
+                except Exception:
+                    failed_words.append(word)
+        if not self.results:
+            self.status_label.setText(f"未找到发音：{', '.join(failed_words)}")
+            self.preview_btn.setEnabled(False)
+        else:
+            msg = f"找到 {len(self.results)} 个发音"
+            if failed_words:
+                msg += f"，未找到：{', '.join(failed_words)}"
+            self.status_label.setText(msg)
+            self.preview_btn.setEnabled(True)
+
+    def on_preview(self):
+        if not self.results:
+            return
+        media_dir = mw.col.media.dir()
+        for word, filename, audio_bytes in self.results:
+            filepath = os.path.join(media_dir, filename)
+            if not os.path.exists(filepath):
+                with open(filepath, "wb") as f:
+                    f.write(audio_bytes)
+            play_audio_file(filename)
+
+    def on_add(self):
+        if not self.results:
+            self.status_label.setText("请先查询发音")
+            return
+        field = self.field_combo.currentText()
+        content = self.note[field]
+        # 写入所有音频文件到媒体库
+        media_dir = mw.col.media.dir()
+        for word, filename, audio_bytes in self.results:
+            filepath = os.path.join(media_dir, filename)
+            if not os.path.exists(filepath):
+                with open(filepath, "wb") as f:
+                    f.write(audio_bytes)
+        # 收集所有保留的发音（原有 + 新增）
+        # 先从现有内容中提取所有原有的单词（排除新增的和正在替换的）
+        new_filenames = [filename for _, filename, _ in self.results]
+        existing_entries = []
+        for pr in self.existing_prons:
+            if pr not in new_filenames and pr != self.replacing_pron:
+                word = pr.replace(".mp3", "")
+                existing_entries.append((word, pr))
+        # 移除整个现有的发音容器
+        pattern_container = re.compile(
+            r'<div\s+style="margin-top:\s*8px;">.*?</div>',
+            re.DOTALL
+        )
+        content = pattern_container.sub('', content)
+        # 也移除 [sound:] 格式的标记
+        for pr in self.existing_prons:
+            pattern_sound = re.compile(r'\s?\[sound:' + re.escape(pr) + r'\]\s?')
+            content = pattern_sound.sub(' ', content)
+        # 移除正在被替换的旧发音
+        if self.replacing_pron:
+            content = remove_pronunciation(content, self.replacing_pron)
+            self.replacing_pron = None
+        # 合并所有发音：保留的 + 新增的
+        new_entries = [(word, filename) for word, filename, _ in self.results]
+        all_entries = existing_entries + new_entries
+        # 构建合并后的 HTML
+        audio_html = build_pronunciation_html(all_entries)
+        if content and not content.endswith("\n"):
+            content += "\n"
+        content += audio_html
+        # 清理多余空行
+        content = re.sub(r'\n{3,}', '\n\n', content)
+        self.note[field] = content.strip()
+        # 更新已有发音列表（不关闭对话框）
+        self.existing_prons = find_existing_pronunciations(self.note[field])
+        self._render_existing_prons()
+        words = ", ".join(w for w, _, _ in self.results)
+        self.status_label.setText(f"已添加：{words}")
+        self.results = []  # 清空查询结果
+
+    def on_delete_existing(self, filename):
+        field = self.field_combo.currentText()
+        content = self.note[field]
+        self.note[field] = remove_pronunciation(content, filename)
+        if filename in self.existing_prons:
+            self.existing_prons.remove(filename)
+        self._render_existing_prons()
+        self.status_label.setText(f"已删除 {filename}")
+
+    def on_repair_existing(self, filename):
+        """修复缺失的音频文件"""
+        word = filename.replace(".mp3", "")
+        config = get_config()
+        api_key = config.get("api_key", "")
+        if not api_key:
+            self.status_label.setText("未配置 API Key，无法修复")
+            return
+        self.status_label.setText(f"正在修复「{word}」...")
+        QApplication.processEvents()
+        new_filename, audio_bytes = fetch_pronunciation(word, api_key)
+        if new_filename and audio_bytes:
+            media_dir = mw.col.media.dir()
+            filepath = os.path.join(media_dir, filename)
+            with open(filepath, "wb") as f:
+                f.write(audio_bytes)
+            self._render_existing_prons()
+            self.status_label.setText(f"已修复 {filename}")
+        else:
+            self.status_label.setText(f"修复失败：未找到「{word}」的发音")
+
+    def on_save_only(self):
+        """保存到数据库，不关闭对话框"""
+        field = self.field_combo.currentText()
+        mw.col.update_note(self.note)
+        # 重新从数据库加载 note，确保后续操作使用最新数据
+        self.note = mw.col.get_note(self.note.id)
+        self.original_content = self.note[self.field_name]
+        self.saved = True
+        self.status_label.setText("已保存")
+
+    def on_modify_existing(self, filename):
+        """修改已有发音：将单词填入输入框，标记为替换模式"""
+        word = filename.replace(".mp3", "")
+        self.word_input.setText(word)
+        self.replacing_pron = filename
+        self.status_label.setText(f"修改「{word}」：编辑单词后点击「查询发音」→「添加发音」")
+
+    def on_refresh(self):
+        """刷新已有发音列表"""
+        field = self.field_combo.currentText()
+        content = self.note[field]
+        self.existing_prons = find_existing_pronunciations(content)
+        self._render_existing_prons()
+        self._check_script_status()
+        self.status_label.setText(f"已刷新，共 {len(self.existing_prons)} 个发音")
+
+    def _check_script_status(self):
+        """检测脚本状态"""
+        try:
+            field = self.field_combo.currentText()
+            if not field or field not in self.note:
+                self.script_status_label.setText("")
+                self.fix_script_btn.setEnabled(False)
+                return
+            content = self.note[field]
+            has_buttons = 'anki-play-' in content
+            has_script = '<script>' in content and 'anki-play-' in content
+            has_dom_ready = 'DOMContentLoaded' in content or 'readyState' in content
+            script_count = content.count('<script>')
+            if not has_buttons:
+                self.script_status_label.setText("")
+                self.fix_script_btn.setEnabled(False)
+                return
+            if not has_script:
+                self.script_status_label.setText("❌ 脚本缺失，按钮可能无法点击")
+                self.fix_script_btn.setEnabled(True)
+            elif not has_dom_ready:
+                self.script_status_label.setText("⚠️ 脚本版本过旧，可能执行失败")
+                self.fix_script_btn.setEnabled(True)
+            elif script_count > 1:
+                self.script_status_label.setText("⚠️ 存在多个脚本块，可能冲突")
+                self.fix_script_btn.setEnabled(True)
+            else:
+                self.script_status_label.setText("✅ 脚本正常")
+                self.fix_script_btn.setEnabled(False)
+        except Exception:
+            self.script_status_label.setText("")
+            self.fix_script_btn.setEnabled(False)
+
+    def on_fix_script(self):
+        """修复脚本：移除旧脚本，插入新脚本"""
+        field = self.field_combo.currentText()
+        content = self.note[field]
+        # 移除所有现有的 <script> 块
+        pattern_script = re.compile(r'<script>.*?</script>', re.DOTALL)
+        content = pattern_script.sub('', content)
+        # 找到发音容器的起始位置
+        container_start = content.find('<div style="margin-top:8px;">')
+        if container_start == -1:
+            # 尝试其他格式
+            container_start = content.find('<div style="margin-top: 8px;">')
+        if container_start == -1:
+            self.status_label.setText("未找到发音容器")
+            return
+        # 从容器起始位置找到最后一个 </div>
+        last_div_end = content.rfind('</div>', container_start)
+        if last_div_end == -1:
+            self.status_label.setText("未找到容器结束标签")
+            return
+        # 生成新脚本
+        new_script = (
+            '<script>'
+            '(function(){'
+            'function init(){'
+            "var v=+(localStorage.getItem('anki-sender-vol')||'0.8');"
+            'var sl=document.getElementById(\'anki-vol\');'
+            'var lb=document.getElementById(\'anki-vol-val\');'
+            "if(sl){sl.value=Math.round(v*100);lb.textContent=v.toFixed(1);"
+            "sl.oninput=function(){v=this.value/100;lb.textContent=v.toFixed(1);"
+            "localStorage.setItem('anki-sender-vol',v);};}"
+            "document.querySelectorAll('[id^=anki-play-]').forEach(function(b){"
+            "b.onclick=function(){var a=new Audio(this.id.replace('anki-play-','')+'.mp3');a.volume=v;a.play();};});"
+            '}'
+            "if(document.readyState==='loading'){"
+            "document.addEventListener('DOMContentLoaded',init);"
+            '}else{'
+            'init();'
+            '}'
+            '})();'
+            '</script>'
+        )
+        # 在最后一个 </div> 前插入脚本
+        before = content[:last_div_end]
+        after = content[last_div_end:]
+        content = before + new_script + after
+        self.note[field] = content
+        self._check_script_status()
+        self.status_label.setText("已修复脚本")
+
+
+# ============================================================
+# 单张添加发音
+# ============================================================
+
+def get_current_card_and_note():
+    if mw.reviewer and mw.reviewer.card:
+        card = mw.reviewer.card
+        # 从数据库重新加载 card 和 note，避免缓存问题
+        card = mw.col.get_card(card.id)
+        return card, card.note()
+    try:
+        browser = dialogs._dialogs.get("Browser")
+        if browser:
+            browser = browser[1]
+            if browser:
+                selected = browser.selectedCards()
+                if selected:
+                    card = mw.col.get_card(selected[0])
+                    return card, card.note()
+    except Exception:
+        pass
+    return None, None
+
+
+def add_pronunciation_single():
+    card, note = get_current_card_and_note()
+    if not note:
+        utils.tooltip("未找到当前卡片")
+        return
+    config = get_config()
+    field_name = config.get("target_field", "引用")
+    if field_name not in note.keys():
+        utils.tooltip(f"字段「{field_name}」不存在，可用字段：{', '.join(note.keys())}")
+        return
+    content = note[field_name]
+    detected_word = extract_word(content)
+    existing_prons = find_existing_pronunciations(content)
+    parent = mw.app.activeWindow() or mw
+    dialog = PronDialog(parent, detected_word, existing_prons, note, field_name)
+    dialog.exec()
+
+
+# ============================================================
+# 批量添加发音
+# ============================================================
+
+def add_pronunciation_batch():
+    try:
+        browser = dialogs._dialogs.get("Browser")
+        if not browser:
+            utils.tooltip("请在浏览器中使用批量模式")
+            return
+        browser = browser[1]
+    except Exception:
+        utils.tooltip("请在浏览器中使用批量模式")
+        return
+    if not browser:
+        utils.tooltip("请在浏览器中使用批量模式")
+        return
+    selected_ids = browser.selectedCards()
+    if not selected_ids:
+        utils.tooltip("请先选中要添加发音的卡片")
+        return
+    config = get_config()
+    field_name = config.get("target_field", "引用")
+    success = 0
+    skipped = 0
+    failed = 0
+    for card_id in selected_ids:
+        card = mw.col.get_card(card_id)
+        note = card.note()
+        if field_name not in note.keys():
+            failed += 1
+            continue
+        content = note[field_name]
+        existing_prons = find_existing_pronunciations(content)
+        if existing_prons:
+            skipped += 1
+            continue
+        detected_word = extract_word(content)
+        parent = mw.app.activeWindow() or mw
+        dialog = PronDialog(parent, detected_word, existing_prons, note, field_name)
+        dialog.exec()
+        if dialog.saved:
+            success += 1
+        else:
+            failed += 1
+    utils.tooltip(
+        f"批量完成：{success} 张添加成功，"
+        f"{skipped} 张跳过（已有发音），"
+        f"{failed} 张失败"
+    )
+
+
+# ============================================================
+# 设置弹窗
+# ============================================================
+
+
+# ============================================================
+# 批量修复发音
+# ============================================================
+
+def repair_pronunciation_batch():
+    """批量修复选中卡片中缺失的音频文件"""
+    try:
+        browser = dialogs._dialogs.get("Browser")
+        if not browser:
+            utils.tooltip("请在浏览器中使用批量修复")
+            return
+        browser = browser[1]
+    except Exception:
+        utils.tooltip("请在浏览器中使用批量修复")
+        return
+    if not browser:
+        utils.tooltip("请在浏览器中使用批量修复")
+        return
+    selected_ids = browser.selectedCards()
+    if not selected_ids:
+        utils.tooltip("请先选中要修复的卡片")
+        return
+    config = get_config()
+    api_key = config.get("api_key", "")
+    if not api_key:
+        utils.tooltip("未配置 API Key，无法修复")
+        return
+    field_name = config.get("target_field", "引用")
+    fixed = 0
+    skipped = 0
+    failed = 0
+    for card_id in selected_ids:
+        card = mw.col.get_card(card_id)
+        note = card.note()
+        if field_name not in note.keys():
+            failed += 1
+            continue
+        content = note[field_name]
+        existing_prons = find_existing_pronunciations(content)
+        if not existing_prons:
+            skipped += 1
+            continue
+        # 检查每个发音文件是否存在，缺失的尝试修复
+        card_fixed = False
+        for pr in existing_prons:
+            if check_audio_exists(pr):
+                continue
+            word = pr.replace(".mp3", "")
+            filename, audio_bytes = fetch_pronunciation(word, api_key)
+            if filename and audio_bytes:
+                media_dir = mw.col.media.dir()
+                filepath = os.path.join(media_dir, pr)
+                with open(filepath, "wb") as f:
+                    f.write(audio_bytes)
+                card_fixed = True
+        if card_fixed:
+            fixed += 1
+        else:
+            skipped += 1
+    utils.tooltip(
+        f"批量修复完成：{fixed} 张修复成功，"
+        f"{skipped} 张无需修复，"
+        f"{failed} 张失败"
+    )
+
+
+def repair_script_batch():
+    """批量修复选中卡片的播放脚本"""
+    try:
+        browser = dialogs._dialogs.get("Browser")
+        if not browser:
+            utils.tooltip("请在浏览器中使用批量修复")
+            return
+        browser = browser[1]
+    except Exception:
+        utils.tooltip("请在浏览器中使用批量修复")
+        return
+    if not browser:
+        utils.tooltip("请在浏览器中使用批量修复")
+        return
+    selected_ids = browser.selectedCards()
+    if not selected_ids:
+        utils.tooltip("请先选中要修复的卡片")
+        return
+    field_name = get_config().get("target_field", "引用")
+    new_script = (
+        '<script>'
+        '(function(){'
+        'function init(){'
+        "var v=+(localStorage.getItem('anki-sender-vol')||'0.8');"
+        'var sl=document.getElementById(\'anki-vol\');'
+        'var lb=document.getElementById(\'anki-vol-val\');'
+        "if(sl){sl.value=Math.round(v*100);lb.textContent=v.toFixed(1);"
+        "sl.oninput=function(){v=this.value/100;lb.textContent=v.toFixed(1);"
+        "localStorage.setItem('anki-sender-vol',v);};}"
+        "document.querySelectorAll('[id^=anki-play-]').forEach(function(b){"
+        "b.onclick=function(){var a=new Audio(this.id.replace('anki-play-','')+'.mp3');a.volume=v;a.play();};});"
+        '}'
+        "if(document.readyState==='loading'){"
+        "document.addEventListener('DOMContentLoaded',init);"
+        '}else{'
+        'init();'
+        '}'
+        '})();'
+        '</script>'
+    )
+    fixed = 0
+    skipped = 0
+    failed = 0
+    for card_id in selected_ids:
+        card = mw.col.get_card(card_id)
+        note = card.note()
+        if field_name not in note.keys():
+            failed += 1
+            continue
+        content = note[field_name]
+        has_buttons = 'anki-play-' in content
+        if not has_buttons:
+            skipped += 1
+            continue
+        has_dom_ready = 'DOMContentLoaded' in content or 'readyState' in content
+        script_count = content.count('<script>')
+        if has_dom_ready and script_count <= 1:
+            skipped += 1
+            continue
+        # 移除所有旧脚本
+        pattern_script = re.compile(r'<script>.*?</script>', re.DOTALL)
+        content = pattern_script.sub('', content)
+        # 在发音容器的 </div> 前插入新脚本
+        pattern_container = re.compile(
+            r'(<div\s+style="margin-top:\s*8px;">)(.*?)(</div>)',
+            re.DOTALL
+        )
+        match = pattern_container.search(content)
+        if match:
+            before = content[:match.end() - len('</div>')]
+            after = content[match.end() - len('</div>'):]
+            content = before + new_script + after
+        note[field_name] = content
+        mw.col.update_note(note)
+        fixed += 1
+    utils.tooltip(
+        f"批量脚本修复完成：{fixed} 张修复成功，"
+        f"{skipped} 张无需修复，"
+        f"{failed} 张失败"
+    )
+
+class SettingsDialog(QDialog):
+    def __init__(self):
+        super().__init__(mw)
+        self.setWindowTitle("发音补丁 — 设置")
+        self.setMinimumWidth(500)
+        config = get_config()
+        layout = QVBoxLayout()
+
+        api_group = QGroupBox("Merriam-Webster API Key")
+        api_layout = QHBoxLayout()
+        self.api_input = QLineEdit(config.get("api_key", ""))
+        self.api_input.setPlaceholderText("免费注册获取：dictionaryapi.com")
+        api_layout.addWidget(QLabel("API Key："))
+        api_layout.addWidget(self.api_input)
+        api_group.setLayout(api_layout)
+        layout.addWidget(api_group)
+
+        import_btn = QPushButton("从 anki-sender 插件导入 API Key")
+        import_btn.clicked.connect(self.import_from_obsidian)
+        layout.addWidget(import_btn)
+
+        field_group = QGroupBox("默认设置")
+        field_layout = QFormLayout()
+        self.field_input = QLineEdit(config.get("target_field", "引用"))
+        field_layout.addRow("默认写入字段：", self.field_input)
+        self.shortcut_input = QLineEdit(config.get("shortcut", "Ctrl+Shift+F"))
+        field_layout.addRow("快捷键：", self.shortcut_input)
+        field_group.setLayout(field_layout)
+        layout.addWidget(field_group)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+        save_btn = QPushButton("保存")
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self.on_save)
+        btn_layout.addWidget(save_btn)
+        layout.addLayout(btn_layout)
+
+        self.setLayout(layout)
+
+    def import_from_obsidian(self):
+        possible_paths = [
+            "D:/software/个人笔记/.obsidian/plugins/anki-sender/data.json",
+            os.path.expanduser("~/Documents/个人笔记/.obsidian/plugins/anki-sender/data.json"),
+            os.path.expanduser("~/Desktop/个人笔记/.obsidian/plugins/anki-sender/data.json"),
+        ]
+        for path in possible_paths:
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    key = data.get("dictionaryApiKey", "")
+                    if key:
+                        self.api_input.setText(key)
+                        utils.tooltip("已导入 API Key")
+                        return
+                except Exception:
+                    pass
+        utils.tooltip("未找到 anki-sender 配置文件，请手动输入 API Key")
+
+    def on_save(self):
+        config = get_config()
+        config["api_key"] = self.api_input.text().strip()
+        config["target_field"] = self.field_input.text().strip() or "引用"
+        config["shortcut"] = self.shortcut_input.text().strip() or "Ctrl+Shift+F"
+        write_config(config)
+        utils.tooltip("设置已保存")
+        self.accept()
+
+
+# ============================================================
+# 菜单和快捷键注册
+# ============================================================
+
+def setup_menu():
+    try:
+        menu = mw.form.menuTools.addMenu("发音补丁")
+        menu.addAction("添加发音（当前卡片）", add_pronunciation_single)
+        menu.addAction("批量添加发音", add_pronunciation_batch)
+        menu.addAction("批量修复发音", repair_pronunciation_batch)
+        menu.addAction("批量修复脚本", repair_script_batch)
+        menu.addSeparator()
+        menu.addAction("设置", lambda: SettingsDialog().exec())
+    except Exception:
+        pass  # mw 未就绪时静默跳过，等 hook 触发时再注册
+
+
+def on_shortcuts(shortcuts):
+    config = get_config()
+    shortcut = config.get("shortcut", "Ctrl+Alt+F")
+    shortcuts.append((shortcut, add_pronunciation_single))
+
+
+def setup_shortcut():
+    """在主窗口注册全局快捷键"""
+    config = get_config()
+    shortcut = config.get("shortcut", "Ctrl+Alt+F")
+    sc = QShortcut(QKeySequence(shortcut), mw)
+    sc.activated.connect(add_pronunciation_single)
+
+
+def on_browser_menu(browser):
+    """Browser 顶部 Edit 菜单"""
+    config = get_config()
+    shortcut = config.get("shortcut", "Ctrl+Alt+F")
+    menu = browser.form.menuEdit.addMenu("发音补丁")
+    action = menu.addAction("添加发音")
+    action.setShortcut(QKeySequence(shortcut))
+    action.triggered.connect(add_pronunciation_single)
+    menu.addAction("批量添加发音", add_pronunciation_batch)
+    menu.addAction("批量修复发音", repair_pronunciation_batch)
+    menu.addAction("批量修复脚本", repair_script_batch)
+
+
+def on_browser_context_menu(browser, menu):
+    """Browser 右键菜单"""
+    menu.addSeparator()
+    menu.addAction("添加发音", add_pronunciation_single)
+    menu.addAction("批量添加发音", add_pronunciation_batch)
+    menu.addAction("批量修复发音", repair_pronunciation_batch)
+    menu.addAction("批量修复脚本", repair_script_batch)
+
+
+# ============================================================
+# 插件入口（模块级别注册 hooks，兼容不同 Anki 版本）
+# ============================================================
+
+# 尝试注册各种 hooks，跳过不存在的
+try:
+    gui_hooks.main_window_did_init.append(setup_menu)
+    gui_hooks.main_window_did_init.append(setup_shortcut)
+except AttributeError:
+    # 旧版 Anki 没有 main_window_did_init，直接调用
+    setup_menu()
+    setup_shortcut()
+
+try:
+    gui_hooks.reviewer_did_init_shortcuts.append(on_shortcuts)
+except AttributeError:
+    pass
+
+try:
+    gui_hooks.browser_menus_did_init.append(on_browser_menu)
+except AttributeError:
+    pass
+
+try:
+    gui_hooks.browser_will_show_context_menu.append(on_browser_context_menu)
+except AttributeError:
+    pass
