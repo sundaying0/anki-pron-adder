@@ -772,7 +772,10 @@ class PronDialog(QDialog):
     def _detect_sentences(self):
         """检测当前字段中的长英文语句"""
         field = self.field_combo.currentText()
-        content = self.note.get(field, "")
+        try:
+            content = self.note[field]
+        except (KeyError, IndexError):
+            content = ""
         self.detected_sentences = find_long_sentences(content)
         # 同时检测已有 TTS 按钮
         existing_tts = re.findall(r'anki-tts-[a-f0-9]+', content)
