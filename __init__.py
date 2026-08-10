@@ -186,16 +186,16 @@ def fetch_pronunciation(word, api_key):
 # ============================================================
 
 def fetch_tts(text, api_key):
-    """调用小米 MiMo TTS API 生成语音，返回 (filename, audio_bytes) 或 None"""
+    """调用小米 MiMo TTS API 生成语音，返回 (filename, audio_bytes, error_msg)"""
     if not api_key or not text or not text.strip():
-        return None, None
+        return None, None, "未提供 API Key 或文本"
     # 用文本哈希作为文件名，避免重复生成
     text_hash = hashlib.md5(text.strip().encode("utf-8")).hexdigest()[:12]
     filename = f"tts_{text_hash}.mp3"
     # 先检查缓存
     cached = cache_get(f"tts_{text_hash}")
     if cached:
-        return cached
+        return cached[0], cached[1], None
     url = "https://platform.xiaomimimo.com/api/v1/audio/speech"
     payload = json.dumps({
         "model": "tts-1",
@@ -211,12 +211,17 @@ def fetch_tts(text, api_key):
         req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=30) as resp:
             audio_bytes = resp.read()
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
-        return None, None
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")[:200]
+        return None, None, f"HTTP {e.code}: {error_body}"
+    except urllib.error.URLError as e:
+        return None, None, f"网络错误: {e.reason}"
+    except OSError as e:
+        return None, None, f"连接错误: {e}"
     if not audio_bytes or len(audio_bytes) < 100:
-        return None, None
+        return None, None, "返回数据异常（可能 API 参数不正确）"
     cache_put(f"tts_{text_hash}", audio_bytes)
-    return filename, audio_bytes
+    return filename, audio_bytes, None
 
 
 # ============================================================
@@ -769,9 +774,9 @@ class PronDialog(QDialog):
         media_dir = mw.col.media.dir()
         self.tts_status_label.setText("正在生成整句发音...")
         QApplication.processEvents()
-        filename, audio_bytes = fetch_tts(sentence, xiaomi_key)
-        if not filename or not audio_bytes:
-            self.tts_status_label.setText("生成失败，请检查小米 API Key 或网络")
+        filename, audio_bytes, error = fetch_tts(sentence, xiaomi_key)
+        if error:
+            self.tts_status_label.setText(f"生成失败：{error}")
             return
         # 写入媒体库
         filepath = os.path.join(media_dir, filename)
@@ -1088,6 +1093,12 @@ class SettingsDialog(QDialog):
         self.xiaomi_input.setPlaceholderText("platform.xiaomimimo.com 获取")
         xiaomi_layout.addWidget(QLabel("API Key："))
         xiaomi_layout.addWidget(self.xiaomi_input)
+        test_xiaomi_btn = QPushButton("测试")
+        test_xiaomi_btn.setAutoDefault(False)
+        test_xiaomi_btn.clicked.connect(self.test_xiaomi_key)
+        xiaomi_layout.addWidget(test_xiaomi_btn)
+        self.xiaomi_test_label = QLabel("")
+        xiaomi_layout.addWidget(self.xiaomi_test_label)
         xiaomi_group.setLayout(xiaomi_layout)
         layout.addWidget(xiaomi_group)
 
@@ -1112,6 +1123,20 @@ class SettingsDialog(QDialog):
         layout.addLayout(btn_layout)
 
         self.setLayout(layout)
+
+    def test_xiaomi_key(self):
+        """测试小米 MiMo API Key 是否可用"""
+        key = self.xiaomi_input.text().strip()
+        if not key:
+            self.xiaomi_test_label.setText("❌ 请先输入 API Key")
+            return
+        self.xiaomi_test_label.setText("测试中...")
+        QApplication.processEvents()
+        filename, audio_bytes, error = fetch_tts("Hello, this is a test.", key)
+        if error:
+            self.xiaomi_test_label.setText(f"❌ {error[:60]}")
+        else:
+            self.xiaomi_test_label.setText("✅ 可用")
 
     def import_from_obsidian(self):
         possible_paths = [
