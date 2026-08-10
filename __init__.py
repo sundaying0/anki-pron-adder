@@ -353,6 +353,8 @@ class PronDialog(QDialog):
         self.result_action = None
         # 修改模式：记录正在被替换的旧发音文件名
         self.replacing_pron = None
+        # TTS 修改模式：记录正在被替换的旧 TTS ID
+        self.modifying_tts_id = None
 
         layout = QVBoxLayout()
 
@@ -410,11 +412,16 @@ class PronDialog(QDialog):
         gen_tts_btn.setAutoDefault(False)
         gen_tts_btn.clicked.connect(self.on_generate_tts)
         tts_btn_layout.addWidget(gen_tts_btn)
-        rm_tts_btn = QPushButton("移除整句发音")
+        rm_tts_btn = QPushButton("移除全部")
         rm_tts_btn.setAutoDefault(False)
-        rm_tts_btn.clicked.connect(self.on_remove_tts)
+        rm_tts_btn.clicked.connect(self.on_remove_all_tts)
         tts_btn_layout.addWidget(rm_tts_btn)
         tts_layout.addLayout(tts_btn_layout)
+        # 已有整句发音列表
+        self.tts_exist_group = QGroupBox("已有整句发音")
+        self.tts_exist_layout = QVBoxLayout()
+        self.tts_exist_group.setLayout(self.tts_exist_layout)
+        tts_layout.addWidget(self.tts_exist_group)
         self.tts_status_label = QLabel("")
         self.tts_status_label.setWordWrap(True)
         tts_layout.addWidget(self.tts_status_label)
@@ -690,15 +697,21 @@ class PronDialog(QDialog):
                 self.fix_script_btn.setEnabled(False)
                 return
             content = self.note[field]
-            has_buttons = 'anki-play-' in content
-            has_script = '<script>' in content and 'anki-play-' in content
+            has_word_btns = 'anki-play-' in content
+            has_tts_btns = 'anki-tts-' in content
+            has_buttons = has_word_btns or has_tts_btns
+            has_script = '<script>' in content and has_word_btns
             has_dom_ready = 'DOMContentLoaded' in content or 'readyState' in content
             script_count = content.count('<script>')
             if not has_buttons:
                 self.script_status_label.setText("")
                 self.fix_script_btn.setEnabled(False)
                 return
-            if not has_script:
+            if has_tts_btns and not has_word_btns:
+                # 只有 TTS 按钮，不需要修复脚本（TTS 按钮用 inline onclick）
+                self.script_status_label.setText("✅ TTS 按钮正常（使用 inline 播放）")
+                self.fix_script_btn.setEnabled(False)
+            elif not has_script:
                 self.script_status_label.setText("❌ 脚本缺失，按钮可能无法点击")
                 self.fix_script_btn.setEnabled(True)
             elif not has_dom_ready:
@@ -764,16 +777,75 @@ class PronDialog(QDialog):
         self._check_script_status()
         self.status_label.setText("已修复脚本")
 
-    def _update_tts_status(self):
-        """更新 TTS 状态（显示已有整句发音数量）"""
+    def _find_existing_tts(self):
+        """查找已有的 TTS 整句发音，返回 [(tts_id, filename, display_text), ...]"""
         field = self.field_combo.currentText()
         try:
             content = self.note[field]
         except (KeyError, IndexError):
-            content = ""
-        existing_tts = re.findall(r'anki-tts-[a-f0-9]+', content)
+            return []
+        results = []
+        # 匹配 TTS 按钮：<button id="anki-tts-xxx" ...>🔊 text...</button>
+        pattern = re.compile(
+            r'<button[^>]*id="(anki-tts-[a-f0-9]+)"[^>]*>(.*?)</button>',
+            re.DOTALL
+        )
+        for m in pattern.finditer(content):
+            tts_id = m.group(1)
+            btn_text = re.sub(r'<[^>]+>', '', m.group(2)).strip()
+            # 去掉开头的 🔊 符号
+            btn_text = re.sub(r'^🔊\s*', '', btn_text)
+            filename = tts_id + ".mp3"
+            results.append((tts_id, filename, btn_text))
+        return results
+
+    def _render_existing_tts(self):
+        """渲染已有 TTS 整句发音列表"""
+        while self.tts_exist_layout.count():
+            item = self.tts_exist_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+            elif item.layout():
+                while item.layout().count():
+                    sub = item.layout().takeAt(0)
+                    if sub.widget():
+                        sub.widget().deleteLater()
+        existing_tts = self._find_existing_tts()
+        if not existing_tts:
+            self.tts_exist_group.setVisible(False)
+            return
+        self.tts_exist_group.setVisible(True)
+        for tts_id, filename, display_text in existing_tts:
+            row = QHBoxLayout()
+            exists = check_audio_exists(filename)
+            if exists:
+                status_label = QLabel("  ✅")
+                status_label.setToolTip("音频文件正常")
+            else:
+                status_label = QLabel("  ❌")
+                status_label.setToolTip("音频文件缺失")
+            row.addWidget(status_label)
+            row.addWidget(QLabel(f"  {display_text[:50]}"))
+            mod_btn = QPushButton("修改")
+            mod_btn.setMinimumWidth(50)
+            mod_btn.setMaximumWidth(80)
+            mod_btn.setAutoDefault(False)
+            mod_btn.clicked.connect(lambda _, t=display_text: self.on_modify_tts(t))
+            row.addWidget(mod_btn)
+            del_btn = QPushButton("删除")
+            del_btn.setMinimumWidth(50)
+            del_btn.setMaximumWidth(80)
+            del_btn.setAutoDefault(False)
+            del_btn.clicked.connect(lambda _, i=tts_id: self.on_delete_tts(i))
+            row.addWidget(del_btn)
+            self.tts_exist_layout.addLayout(row)
+
+    def _update_tts_status(self):
+        """更新 TTS 状态并渲染已有整句发音列表"""
+        self._render_existing_tts()
+        existing_tts = self._find_existing_tts()
         if existing_tts:
-            self.tts_status_label.setText(f"已有 {len(set(existing_tts))} 个整句发音")
+            self.tts_status_label.setText(f"已有 {len(existing_tts)} 个整句发音")
         else:
             self.tts_status_label.setText("")
 
@@ -791,6 +863,14 @@ class PronDialog(QDialog):
         field = self.field_combo.currentText()
         content = self.note[field]
         media_dir = mw.col.media.dir()
+        # 如果是修改模式，先删除旧的 TTS 按钮
+        if self.modifying_tts_id:
+            old_pattern = re.compile(
+                r'<button[^>]*id="' + re.escape(self.modifying_tts_id) + r'"[^>]*>.*?</button>',
+                re.DOTALL
+            )
+            content = old_pattern.sub('', content)
+            self.modifying_tts_id = None
         self.tts_status_label.setText("正在生成整句发音...")
         QApplication.processEvents()
         filename, audio_bytes, error = fetch_tts(sentence, xiaomi_key)
@@ -823,7 +903,7 @@ class PronDialog(QDialog):
         self._update_tts_status()
         self.status_label.setText(f"已添加整句发音：{sentence[:50]}")
 
-    def on_remove_tts(self):
+    def on_remove_all_tts(self):
         """移除所有整句发音按钮"""
         field = self.field_combo.currentText()
         content = self.note[field]
@@ -834,9 +914,43 @@ class PronDialog(QDialog):
         self.note[field] = new_content.strip()
         self._update_tts_status()
         if removed:
-            self.status_label.setText("已移除整句发音")
+            self.status_label.setText("已移除全部整句发音")
         else:
             self.status_label.setText("没有可移除的整句发音")
+
+    def on_delete_tts(self, tts_id):
+        """删除单个 TTS 整句发音"""
+        field = self.field_combo.currentText()
+        content = self.note[field]
+        # 删除特定 TTS 按钮
+        pattern = re.compile(
+            r'<button[^>]*id="' + re.escape(tts_id) + r'"[^>]*>.*?</button>',
+            re.DOTALL
+        )
+        self.note[field] = pattern.sub('', content).strip()
+        self._update_tts_status()
+        self.status_label.setText(f"已删除 {tts_id}")
+
+    def on_modify_tts(self, display_text):
+        """修改 TTS：将句子文本填入输入框，标记为替换模式"""
+        self.tts_input.setText(display_text)
+        # 找到对应的 TTS ID
+        field = self.field_combo.currentText()
+        try:
+            content = self.note[field]
+        except (KeyError, IndexError):
+            content = ""
+        pattern = re.compile(
+            r'<button[^>]*id="(anki-tts-[a-f0-9]+)"[^>]*>(.*?)</button>',
+            re.DOTALL
+        )
+        for m in pattern.finditer(content):
+            btn_text = re.sub(r'<[^>]+>', '', m.group(2)).strip()
+            btn_text = re.sub(r'^🔊\s*', '', btn_text)
+            if btn_text == display_text or btn_text.startswith(display_text[:30]):
+                self.modifying_tts_id = m.group(1)
+                break
+        self.tts_status_label.setText("修改模式：编辑句子后点击「生成整句发音」")
 
 
 # ============================================================
