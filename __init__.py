@@ -804,7 +804,9 @@ class PronDialog(QDialog):
             btn_text = re.sub(r'<[^>]+>', '', m.group(2)).strip()
             # 去掉开头的 🔊 符号
             btn_text = re.sub(r'^🔊\s*', '', btn_text)
-            filename = tts_id + ".mp3"
+            # tts_id 格式: anki-tts-{hash}, 实际文件: tts_{hash}.mp3
+            hash_part = tts_id.replace("anki-tts-", "")
+            filename = f"tts_{hash_part}.mp3"
             results.append((tts_id, filename, btn_text))
         return results
 
