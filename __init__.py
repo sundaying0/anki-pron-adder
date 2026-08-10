@@ -196,12 +196,22 @@ def fetch_tts(text, api_key):
     cached = cache_get(f"tts_{text_hash}")
     if cached:
         return cached[0], cached[1], None
-    url = "https://platform.xiaomimimo.com/api/v1/audio/speech"
+    # 根据 key 格式选择正确的 BASE_URL
+    if api_key.startswith("tp-"):
+        base_url = "https://token-plan-cn.xiaomimimo.com/v1"
+    else:
+        base_url = "https://api.xiaomimimo.com/v1"
+    url = f"{base_url}/chat/completions"
     payload = json.dumps({
-        "model": "tts-1",
-        "input": text.strip(),
-        "voice": "alloy",
-        "response_format": "mp3"
+        "model": "mimo-v2.5-tts",
+        "messages": [
+            {"role": "user", "content": "Generate speech for the following text."},
+            {"role": "assistant", "content": text.strip()}
+        ],
+        "audio": {
+            "format": "mp3",
+            "voice": "mimo_default"
+        }
     }).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
@@ -209,8 +219,8 @@ def fetch_tts(text, api_key):
     }
     try:
         req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            audio_bytes = resp.read()
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            resp_data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8", errors="replace")[:200]
         return None, None, f"HTTP {e.code}: {error_body}"
@@ -218,8 +228,17 @@ def fetch_tts(text, api_key):
         return None, None, f"网络错误: {e.reason}"
     except OSError as e:
         return None, None, f"连接错误: {e}"
+    except json.JSONDecodeError:
+        return None, None, "响应格式错误（非 JSON）"
+    # 从响应中提取 base64 音频数据
+    try:
+        audio_b64 = resp_data["choices"][0]["message"]["audio"]["data"]
+        import base64
+        audio_bytes = base64.b64decode(audio_b64)
+    except (KeyError, IndexError, TypeError):
+        return None, None, f"响应中无音频数据: {str(resp_data)[:150]}"
     if not audio_bytes or len(audio_bytes) < 100:
-        return None, None, "返回数据异常（可能 API 参数不正确）"
+        return None, None, "音频数据异常"
     cache_put(f"tts_{text_hash}", audio_bytes)
     return filename, audio_bytes, None
 
