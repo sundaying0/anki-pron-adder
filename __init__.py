@@ -883,7 +883,7 @@ class PronDialog(QDialog):
             with open(filepath, "wb") as f:
                 f.write(audio_bytes)
         # 在内容末尾追加 TTS 播放按钮
-        tts_id = filename.replace(".mp3", "")
+        tts_id = "anki-tts-" + filename.replace(".mp3", "").replace("tts_", "")
         tts_btn_style = (
             "background:#e8f5e9;border:1px solid #4caf50;border-radius:3px;"
             "padding:2px 6px;cursor:pointer;font-size:12px;margin-left:4px;"
