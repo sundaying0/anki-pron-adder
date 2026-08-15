@@ -701,7 +701,7 @@ class PronDialog(QDialog):
                 return
             # 检测单词按钮是否使用 inline onclick（新版）还是依赖 script（旧版）
             word_btn_has_onclick = bool(re.search(
-                r'id="anki-play-[^"]*"\s+onclick="', content))
+                r'id="anki-play-[^"]*"[^>]*onclick="', content))
             has_old_script = '<script>' in content and has_word_btns
             if has_word_btns and not word_btn_has_onclick:
                 # 旧版按钮，没有 inline onclick，需要修复
