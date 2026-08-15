@@ -1109,7 +1109,7 @@ def repair_pronunciation_batch():
 
 
 def repair_script_batch():
-    """批量修复选中卡片的播放脚本"""
+    """批量修复选中卡片：为旧版单词按钮添加 inline onclick，移除残留 script"""
     try:
         browser = dialogs._dialogs.get("Browser")
         if not browser:
@@ -1127,27 +1127,6 @@ def repair_script_batch():
         utils.tooltip("请先选中要修复的卡片")
         return
     field_name = get_config().get("target_field", "引用")
-    new_script = (
-        '<script>'
-        '(function(){'
-        'function init(){'
-        "var v=+(localStorage.getItem('anki-sender-vol')||'0.8');"
-        'var sl=document.getElementById(\'anki-vol\');'
-        'var lb=document.getElementById(\'anki-vol-val\');'
-        "if(sl){sl.value=Math.round(v*100);lb.textContent=v.toFixed(1);"
-        "sl.oninput=function(){v=this.value/100;lb.textContent=v.toFixed(1);"
-        "localStorage.setItem('anki-sender-vol',v);};}"
-        "document.querySelectorAll('[id^=anki-play-]').forEach(function(b){"
-        "b.onclick=function(){var a=new Audio(this.id.replace('anki-play-','')+'.mp3');a.volume=v;a.play();};});"
-        '}'
-        "if(document.readyState==='loading'){"
-        "document.addEventListener('DOMContentLoaded',init);"
-        '}else{'
-        'init();'
-        '}'
-        '})();'
-        '</script>'
-    )
     fixed = 0
     skipped = 0
     failed = 0
@@ -1158,33 +1137,50 @@ def repair_script_batch():
             failed += 1
             continue
         content = note[field_name]
-        has_buttons = 'anki-play-' in content
-        if not has_buttons:
+        has_word_btns = 'anki-play-' in content
+        if not has_word_btns:
             skipped += 1
             continue
-        has_dom_ready = 'DOMContentLoaded' in content or 'readyState' in content
-        script_count = content.count('<script>')
-        if has_dom_ready and script_count <= 1:
+        # 检查是否已有 inline onclick
+        word_btn_has_onclick = bool(re.search(
+            r'id="anki-play-[^"]*"\s+onclick="', content))
+        has_old_script = '<script>' in content
+        if word_btn_has_onclick and not has_old_script:
             skipped += 1
             continue
-        # 移除所有旧脚本
+        # 1. 移除所有旧 script
         pattern_script = re.compile(r'<script>.*?</script>', re.DOTALL)
         content = pattern_script.sub('', content)
-        # 在发音容器的 </div> 前插入新脚本
-        pattern_container = re.compile(
-            r'(<div\s+style="margin-top:\s*8px;">)(.*?)(</div>)',
-            re.DOTALL
-        )
-        match = pattern_container.search(content)
-        if match:
-            before = content[:match.end() - len('</div>')]
-            after = content[match.end() - len('</div>'):]
-            content = before + new_script + after
+        # 2. 为没有 onclick 的旧版按钮添加 inline onclick
+        def _add_onclick(m):
+            btn = m.group(0)
+            if 'onclick=' in btn:
+                return btn
+            id_match = re.search(r'id="anki-play-([^"]+)"', btn)
+            if not id_match:
+                return btn
+            word = id_match.group(1)
+            onclick = (
+                f"var v=+(localStorage.getItem('anki-sender-vol')||'0.8');"
+                f"var a=new Audio('{word}.mp3');a.volume=v;a.play();"
+            )
+            return btn.replace('>', f' onclick="{onclick}">', 1)
+        content = re.sub(
+            r'<button\s+id="anki-play-[^"]*"[^>]*>.*?</button>',
+            _add_onclick, content, flags=re.DOTALL)
+        # 3. 为旧版音量滑块添加 oninput
+        if 'anki-vol' in content and 'oninput=' not in content:
+            content = re.sub(
+                r'(<input\s+id="anki-vol"\s+type="range"[^>]*?)(>)',
+                r'\1 oninput="var v=this.value/100;'
+                r"document.getElementById('anki-vol-val').textContent=v.toFixed(1);"
+                r"localStorage.setItem('anki-sender-vol',v);\"\2",
+                content)
         note[field_name] = content
         mw.col.update_note(note)
         fixed += 1
     utils.tooltip(
-        f"批量脚本修复完成：{fixed} 张修复成功，"
+        f"批量修复完成：{fixed} 张修复成功，"
         f"{skipped} 张无需修复，"
         f"{failed} 张失败"
     )
