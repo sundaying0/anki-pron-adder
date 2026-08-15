@@ -456,7 +456,11 @@ class PronDialog(QDialog):
             self.note[self.field_name] = self.original_content
         if self._need_refresh and mw.reviewer:
             try:
-                QTimer.singleShot(0, mw.reviewer.show_card)
+                def _refresh():
+                    card = mw.col.get_card(mw.reviewer.card.id)
+                    mw.reviewer.card = card
+                    mw.reviewer.show_card()
+                QTimer.singleShot(0, _refresh)
             except Exception:
                 pass
         event.accept()
