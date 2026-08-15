@@ -341,6 +341,7 @@ class PronDialog(QDialog):
         self.replacing_pron = None
         # TTS 修改模式：记录正在被替换的旧 TTS ID
         self.modifying_tts_id = None
+        self._need_refresh = False
 
         layout = QVBoxLayout()
 
@@ -450,9 +451,14 @@ class PronDialog(QDialog):
         QTimer.singleShot(100, self.word_input.setFocus)
 
     def closeEvent(self, event):
-        """关闭窗口：如果未保存，恢复原始内容"""
+        """关闭窗口：如果未保存，恢复原始内容；已保存则刷新 reviewer"""
         if not self.saved:
             self.note[self.field_name] = self.original_content
+        if self._need_refresh and mw.reviewer:
+            try:
+                QTimer.singleShot(0, mw.reviewer.show_card)
+            except Exception:
+                pass
         event.accept()
 
     def _render_existing_prons(self):
@@ -663,6 +669,7 @@ class PronDialog(QDialog):
         self.note = mw.col.get_note(self.note.id)
         self.original_content = self.note[self.field_name]
         self.saved = True
+        self._need_refresh = True
         self._update_tts_status()
         self.status_label.setText("已保存")
 
