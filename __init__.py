@@ -459,7 +459,10 @@ class PronDialog(QDialog):
                 def _refresh():
                     card = mw.col.get_card(mw.reviewer.card.id)
                     mw.reviewer.card = card
-                    mw.reviewer.show_card()
+                    if hasattr(mw.reviewer, '_renderCard'):
+                        mw.reviewer._renderCard()
+                    elif hasattr(mw.reviewer, 'show_card'):
+                        mw.reviewer.show_card()
                 QTimer.singleShot(0, _refresh)
             except Exception:
                 pass
