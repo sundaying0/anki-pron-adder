@@ -291,6 +291,7 @@ def build_pronunciation_html(entries):
     构建发音按钮 HTML，与 anki-sender 风格完全一致。
     entries: [(word, filename), ...] 支持多个单词
     所有按钮共享一个音量滑块。
+    使用 inline onclick，编辑卡片后不会失效。
     """
     btn_style = (
         "background:#f0f0f0;border:1px solid #ccc;border-radius:4px;"
@@ -298,40 +299,25 @@ def build_pronunciation_html(entries):
     )
     buttons = ""
     for word, filename in entries:
-        buttons += (
-            f'<button id="anki-play-{word}" style="{btn_style}">'
-            f'🔊 {word}</button>'
+        onclick = (
+            f"var v=+(localStorage.getItem('anki-sender-vol')||'0.8');"
+            f"var a=new Audio('{word}.mp3');a.volume=v;a.play();"
         )
-    # 共享音量滑块（只一个）
+        buttons += (
+            f'<button id="anki-play-{word}" style="{btn_style}" '
+            f'onclick="{onclick}">🔊 {word}</button>'
+        )
+    # 共享音量滑块（oninput 直接写在属性上，不依赖 script）
     volume_bar = (
         '<span style="margin-left:8px;font-size:13px;color:#888;">🔈</span>'
         '<input id="anki-vol" type="range" min="0" max="100" value="80" '
-        'style="width:80px;vertical-align:middle;">'
+        'style="width:80px;vertical-align:middle;" '
+        'oninput="var v=this.value/100;'
+        "document.getElementById('anki-vol-val').textContent=v.toFixed(1);"
+        "localStorage.setItem('anki-sender-vol',v);\">"
         '<span id="anki-vol-val" style="font-size:12px;color:#888;">0.8</span>'
     )
-    # 播放脚本（带 DOM 加载检测，防止执行时机问题）
-    script = (
-        '<script>'
-        '(function(){'
-        'function init(){'
-        "var v=+(localStorage.getItem('anki-sender-vol')||'0.8');"
-        'var sl=document.getElementById(\'anki-vol\');'
-        'var lb=document.getElementById(\'anki-vol-val\');'
-        "if(sl){sl.value=Math.round(v*100);lb.textContent=v.toFixed(1);"
-        "sl.oninput=function(){v=this.value/100;lb.textContent=v.toFixed(1);"
-        "localStorage.setItem('anki-sender-vol',v);};}"
-        "document.querySelectorAll('[id^=anki-play-]').forEach(function(b){"
-        "b.onclick=function(){var a=new Audio(this.id.replace('anki-play-','')+'.mp3');a.volume=v;a.play();};});"
-        '}'
-        "if(document.readyState==='loading'){"
-        "document.addEventListener('DOMContentLoaded',init);"
-        '}else{'
-        'init();'
-        '}'
-        '})();'
-        '</script>'
-    )
-    return f'<div style="margin-top:8px;">{buttons}{volume_bar}{script}</div>'
+    return f'<div style="margin-top:8px;">{buttons}{volume_bar}</div>'
 
 
 # ============================================================
@@ -698,7 +684,7 @@ class PronDialog(QDialog):
         self.status_label.setText(f"已刷新，共 {len(self.existing_prons)} 个发音")
 
     def _check_script_status(self):
-        """检测脚本状态"""
+        """检测按钮播放状态（inline onclick 模式，不依赖 script）"""
         try:
             field = self.field_combo.currentText()
             if not field or field not in self.note:
@@ -709,82 +695,66 @@ class PronDialog(QDialog):
             has_word_btns = 'anki-play-' in content
             has_tts_btns = 'anki-tts-' in content
             has_buttons = has_word_btns or has_tts_btns
-            has_script = '<script>' in content and has_word_btns
-            has_dom_ready = 'DOMContentLoaded' in content or 'readyState' in content
-            script_count = content.count('<script>')
             if not has_buttons:
                 self.script_status_label.setText("")
                 self.fix_script_btn.setEnabled(False)
                 return
-            if has_tts_btns and not has_word_btns:
-                # 只有 TTS 按钮，不需要修复脚本（TTS 按钮用 inline onclick）
-                self.script_status_label.setText("✅ TTS 按钮正常（使用 inline 播放）")
-                self.fix_script_btn.setEnabled(False)
-            elif not has_script:
-                self.script_status_label.setText("❌ 脚本缺失，按钮可能无法点击")
+            # 检测单词按钮是否使用 inline onclick（新版）还是依赖 script（旧版）
+            word_btn_has_onclick = bool(re.search(
+                r'id="anki-play-[^"]*"\s+onclick="', content))
+            has_old_script = '<script>' in content and has_word_btns
+            if has_word_btns and not word_btn_has_onclick:
+                # 旧版按钮，没有 inline onclick，需要修复
+                self.script_status_label.setText(
+                    "⚠️ 单词按钮缺少 inline onclick，编辑后会失效")
                 self.fix_script_btn.setEnabled(True)
-            elif not has_dom_ready:
-                self.script_status_label.setText("⚠️ 脚本版本过旧，可能执行失败")
-                self.fix_script_btn.setEnabled(True)
-            elif script_count > 1:
-                self.script_status_label.setText("⚠️ 存在多个脚本块，可能冲突")
+            elif has_old_script:
+                # 有 inline onclick 但还有残留的旧 script，可以清理
+                self.script_status_label.setText(
+                    "⚠️ 存在旧版 script 残留，建议清理")
                 self.fix_script_btn.setEnabled(True)
             else:
-                self.script_status_label.setText("✅ 脚本正常")
+                self.script_status_label.setText("✅ 按钮正常（inline 播放）")
                 self.fix_script_btn.setEnabled(False)
         except Exception:
             self.script_status_label.setText("")
             self.fix_script_btn.setEnabled(False)
 
     def on_fix_script(self):
-        """修复脚本：移除旧脚本，插入新脚本"""
+        """修复按钮：移除旧 script，为旧版单词按钮添加 inline onclick"""
         field = self.field_combo.currentText()
         content = self.note[field]
-        # 移除所有现有的 <script> 块
+        # 1. 移除所有现有的 <script> 块
         pattern_script = re.compile(r'<script>.*?</script>', re.DOTALL)
         content = pattern_script.sub('', content)
-        # 找到发音容器的起始位置
-        container_start = content.find('<div style="margin-top:8px;">')
-        if container_start == -1:
-            # 尝试其他格式
-            container_start = content.find('<div style="margin-top: 8px;">')
-        if container_start == -1:
-            self.status_label.setText("未找到发音容器")
-            return
-        # 从容器起始位置找到最后一个 </div>
-        last_div_end = content.rfind('</div>', container_start)
-        if last_div_end == -1:
-            self.status_label.setText("未找到容器结束标签")
-            return
-        # 生成新脚本
-        new_script = (
-            '<script>'
-            '(function(){'
-            'function init(){'
-            "var v=+(localStorage.getItem('anki-sender-vol')||'0.8');"
-            'var sl=document.getElementById(\'anki-vol\');'
-            'var lb=document.getElementById(\'anki-vol-val\');'
-            "if(sl){sl.value=Math.round(v*100);lb.textContent=v.toFixed(1);"
-            "sl.oninput=function(){v=this.value/100;lb.textContent=v.toFixed(1);"
-            "localStorage.setItem('anki-sender-vol',v);};}"
-            "document.querySelectorAll('[id^=anki-play-]').forEach(function(b){"
-            "b.onclick=function(){var a=new Audio(this.id.replace('anki-play-','')+'.mp3');a.volume=v;a.play();};});"
-            '}'
-            "if(document.readyState==='loading'){"
-            "document.addEventListener('DOMContentLoaded',init);"
-            '}else{'
-            'init();'
-            '}'
-            '})();'
-            '</script>'
-        )
-        # 在最后一个 </div> 前插入脚本
-        before = content[:last_div_end]
-        after = content[last_div_end:]
-        content = before + new_script + after
+        # 2. 为没有 onclick 的旧版单词按钮添加 inline onclick
+        def _add_onclick(m):
+            btn = m.group(0)
+            if 'onclick=' in btn:
+                return btn  # 已有 onclick，跳过
+            id_match = re.search(r'id="anki-play-([^"]+)"', btn)
+            if not id_match:
+                return btn
+            word = id_match.group(1)
+            onclick = (
+                f"var v=+(localStorage.getItem('anki-sender-vol')||'0.8');"
+                f"var a=new Audio('{word}.mp3');a.volume=v;a.play();"
+            )
+            return btn.replace('>', f' onclick="{onclick}">', 1)
+        content = re.sub(
+            r'<button\s+id="anki-play-[^"]*"[^>]*>.*?</button>',
+            _add_onclick, content, flags=re.DOTALL)
+        # 3. 为旧版音量滑块添加 oninput（如果没有的话）
+        if 'anki-vol' in content and 'oninput=' not in content:
+            content = re.sub(
+                r'(<input\s+id="anki-vol"\s+type="range"[^>]*?)(>)',
+                r'\1 oninput="var v=this.value/100;'
+                r"document.getElementById('anki-vol-val').textContent=v.toFixed(1);"
+                r"localStorage.setItem('anki-sender-vol',v);\"\2",
+                content)
         self.note[field] = content
         self._check_script_status()
-        self.status_label.setText("已修复脚本")
+        self.status_label.setText("已修复：添加 inline onclick，移除旧 script")
 
     def _find_existing_tts(self):
         """查找已有的 TTS 整句发音，返回 [(tts_id, filename, display_text), ...]"""
