@@ -1,6 +1,6 @@
 # Anki 发音补丁插件
 
-> 为 Anki 卡片添加美式发音按钮，点击播放，与 anki-sender 风格完全一致。
+> 为 Anki 单词添加美式发音 + 句子添加 TTS 发音，点击播放，与 anki-sender 风格完全一致。
 
 ---
 
@@ -10,20 +10,23 @@
 
 | 功能 | 说明 |
 |------|------|
-| 添加发音 | 输入单词（支持空格分隔多个），从 Merriam-Webster API 下载美式发音 |
-| 点击播放 | HTML `<button>` + `<script>` 实现，不使用 Anki 原生 `[sound:]` 自动播放 |
+| 单词发音 | 输入单词（支持空格分隔多个），从 Merriam-Webster API 下载美式发音 |
+| 整句发音 | 手动输入英文句子，从小米 MiMo TTS API 生成发音 |
+| 点击播放 | HTML inline onclick 实现，编辑卡片后不会失效 |
 | 试听预览 | 添加前可逐个试听已查询的发音 |
-| 编辑管理 | 对已有发音支持删除、修改（替换单词）、修复缺失音频 |
+| 编辑管理 | 对已有发音/句子支持删除、修改、试听、修复缺失音频 |
 | 批量模式 | 在 Browser 中选中多张卡片，逐张确认添加（跳过已有发音） |
-| 脚本检测 | 自动检测播放脚本是否正常，支持一键修复 |
+| 脚本检测 | 自动检测按钮状态，支持一键修复旧版按钮 |
 | 并行查询 | 多单词同时查询，本地缓存加速重复查询 |
+| API 设置 | 支持配置 Merriam-Webster 和小米 MiMo 两个 API Key，带测试按钮 |
 
 ### 使用场景
 
-1. **单张卡片**：复习时按快捷键，弹窗输入单词，添加发音
+1. **单张卡片**：复习时按快捷键，弹窗输入单词或句子，添加发音
 2. **批量处理**：在 Browser 中选中多张卡片，批量添加发音（跳过已有发音的卡片）
 3. **编辑已有**：删除发音、修改发音对应的单词、修复缺失的音频文件
-4. **脚本修复**：卡片发音按钮不响应时，自动检测并修复播放脚本
+4. **整句发音**：手动输入英文句子，一键生成 TTS 发音
+5. **脚本修复**：旧版卡片发音按钮不响应时，自动检测并修复为 inline onclick
 
 ### 快捷键
 
@@ -37,44 +40,39 @@
 ### 2.1 技术栈
 
 - **语言**：Python 3（Anki 内置）
-- **GUI**：PyQt5（Anki 自带）
-- **API**：Merriam-Webster Collegiate Dictionary API
-- **音频格式**：API 返回 WAV，保存为 `.mp3` 文件名（Anki 媒体库兼容）
+- **GUI**：PyQt5/6（Anki 自带）
+- **单词 API**：Merriam-Webster Collegiate Dictionary API（美式发音）
+- **句子 API**：小米 MiMo TTS API（`mimo-v2.5-tts` 模型）
+- **音频格式**：API 返回 WAV/MP3，保存为 `.mp3` 文件名（Anki 媒体库兼容）
 - **并发**：`concurrent.futures.ThreadPoolExecutor` 并行查询多个单词
 - **缓存**：本地文件缓存（`~/.anki-pron-cache/`），避免重复 API 调用
 
 ### 2.2 播放机制
 
-**不使用 Anki 原生 `[sound:]` 语法**（会自动播放），而是使用 HTML 按钮：
+**使用 inline onclick**（不依赖 `<script>`，编辑卡片后不会失效）：
 
 ```html
 <div style="margin-top:8px;">
-  <button id="anki-play-word1" style="...">🔊 word1</button>
-  <button id="anki-play-word2" style="...">🔊 word2</button>
+  <button id="anki-play-word1" style="..."
+    onclick="var v=+(localStorage.getItem('anki-sender-vol')||'0.8');
+    var a=new Audio('word1.mp3');a.volume=v;a.play();">🔊 word1</button>
+  <button id="anki-play-word2" style="..."
+    onclick="var v=+(localStorage.getItem('anki-sender-vol')||'0.8');
+    var a=new Audio('word2.mp3');a.volume=v;a.play();">🔊 word2</button>
   <span>🔈</span>
-  <input id="anki-vol" type="range" min="0" max="100" value="80">
+  <input id="anki-vol" type="range" min="0" max="100" value="80"
+    oninput="var v=this.value/100;
+    document.getElementById('anki-vol-val').textContent=v.toFixed(1);
+    localStorage.setItem('anki-sender-vol',v);">
   <span id="anki-vol-val">0.8</span>
-  <script>
-    (function(){
-      function init(){
-        var v = +(localStorage.getItem('anki-sender-vol') || '0.8');
-        // ... 音量控制 + 点击播放逻辑
-      }
-      if(document.readyState==='loading'){
-        document.addEventListener('DOMContentLoaded',init);
-      }else{
-        init();
-      }
-    })();
-  </script>
 </div>
 ```
 
 **关键点**：
 - 所有按钮共享一个音量滑块
 - 音量通过 `localStorage` 持久化，与 anki-sender 共享
-- 脚本中 `new Audio('word.mp3')` 播放媒体库中的文件
-- DOM 加载检测：防止脚本在 DOM 未就绪时执行
+- 使用 **inline onclick**，不依赖 `<script>`，编辑卡片后不会失效
+- TTS 句子按钮同样使用 inline onclick
 
 ### 2.3 对话框工作流
 
@@ -83,9 +81,10 @@
 | 查询发音 | 从 MW API 查询并缓存发音 | 否 |
 | 试听 | 播放已查询的发音 | 否 |
 | 添加发音 | 将发音写入字段（可多次添加） | 否 |
+| 生成整句发音 | 输入句子，调用小米 TTS API 生成 | 否 |
 | 保存 | 保存到数据库 | 否 |
-| 修复脚本 | 移除旧脚本，插入新版本 | 否 |
-| 刷新 | 重新检测已有发音和脚本状态 | 否 |
+| 修复脚本 | 将旧版按钮转为 inline onclick | 否 |
+| 刷新 | 重新检测已有发音和按钮状态 | 否 |
 | X 关闭 | 未保存时恢复原始内容，关闭 | 是 |
 
 ### 2.4 文件结构
@@ -135,7 +134,8 @@ gui_hooks.browser_will_show_context_menu.append(on_browser_context_menu)
 
 ```json
 {
-    "api_key": "your-mw-api-key",
+    "api_key": "",
+    "xiaomi_api_key": "",
     "target_field": "引用",
     "shortcut": "Ctrl+Alt+F"
 }
@@ -143,16 +143,23 @@ gui_hooks.browser_will_show_context_menu.append(on_browser_context_menu)
 
 | 字段 | 说明 | 默认值 |
 |------|------|--------|
-| `api_key` | Merriam-Webster API Key | 空（需手动配置） |
+| `api_key` | Merriam-Webster API Key（单词发音） | 空（需手动配置） |
+| `xiaomi_api_key` | 小米 MiMo API Key（整句 TTS） | 空（需手动配置） |
 | `target_field` | 发音写入的字段名 | `引用` |
 | `shortcut` | 快捷键 | `Ctrl+Alt+F` |
 
 ### 获取 API Key
 
+**Merriam-Webster（单词发音）**：
 1. 访问 https://dictionaryapi.com/
 2. 注册免费账户
 3. 创建一个 Reference API Key
 4. 复制 Key 到插件设置中
+
+**小米 MiMo（整句 TTS）**：
+1. 访问 https://mimo.mi.com/
+2. 注册并获取 API Key（支持 Token Plan `tp-` 和标准 `sk-` 两种格式）
+3. 复制 Key 到插件设置中
 
 ---
 
