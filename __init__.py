@@ -345,6 +345,10 @@ class PronDialog(QDialog):
 
         layout = QVBoxLayout()
 
+        # 可滚动内容区
+        content_widget = QWidget()
+        content_layout = QVBoxLayout(content_widget)
+
         # 单词输入（支持空格分隔多个单词）
         word_group = QGroupBox("单词")
         word_layout = QHBoxLayout()
@@ -354,14 +358,14 @@ class PronDialog(QDialog):
         word_layout.addWidget(QLabel("单词："))
         word_layout.addWidget(self.word_input)
         word_group.setLayout(word_layout)
-        layout.addWidget(word_group)
+        content_layout.addWidget(word_group)
 
         # 已有发音
         self.exist_group = QGroupBox("已有发音")
         self.exist_layout = QVBoxLayout()
         self._render_existing_prons()
         self.exist_group.setLayout(self.exist_layout)
-        layout.addWidget(self.exist_group)
+        content_layout.addWidget(self.exist_group)
 
         # 目标字段
         field_group = QGroupBox("目标字段")
@@ -372,17 +376,17 @@ class PronDialog(QDialog):
         field_layout.addWidget(QLabel("写入字段："))
         field_layout.addWidget(self.field_combo)
         field_group.setLayout(field_layout)
-        layout.addWidget(field_group)
+        content_layout.addWidget(field_group)
 
         # 状态提示
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
-        layout.addWidget(self.status_label)
+        content_layout.addWidget(self.status_label)
 
         # 脚本状态检测
         self.script_status_label = QLabel("")
         self.script_status_label.setWordWrap(True)
-        layout.addWidget(self.script_status_label)
+        content_layout.addWidget(self.script_status_label)
 
         # TTS 整句发音
         tts_group = QGroupBox("整句发音（小米 TTS）")
@@ -413,16 +417,23 @@ class PronDialog(QDialog):
         self.tts_status_label.setWordWrap(True)
         tts_layout.addWidget(self.tts_status_label)
         tts_group.setLayout(tts_layout)
-        layout.addWidget(tts_group)
+        content_layout.addWidget(tts_group)
         self._update_tts_status()
 
         # 试听按钮
         self.preview_btn = QPushButton("试听")
         self.preview_btn.setEnabled(False)
         self.preview_btn.clicked.connect(self.on_preview)
-        layout.addWidget(self.preview_btn)
+        content_layout.addWidget(self.preview_btn)
 
-        # 按钮行
+        content_layout.addStretch()
+
+        scroll = QScrollArea()
+        scroll.setWidget(content_widget)
+        scroll.setWidgetResizable(True)
+        layout.addWidget(scroll, 1)
+
+        # 固定底部按钮行（不随内容滚动）
         btn_layout = QHBoxLayout()
         fetch_btn = QPushButton("查询发音")
         fetch_btn.clicked.connect(self.on_fetch)
@@ -451,9 +462,9 @@ class PronDialog(QDialog):
         QTimer.singleShot(100, self.word_input.setFocus)
 
     def closeEvent(self, event):
-        """关闭窗口：如果未保存，恢复原始内容；已保存则刷新 reviewer"""
-        if not self.saved:
-            self.note[self.field_name] = self.original_content
+        """关闭窗口：自动保存修改，刷新 reviewer"""
+        mw.col.update_note(self.note)
+        self.saved = True
         if self._need_refresh and mw.reviewer:
             try:
                 mw.reviewer._redraw_current_card()
@@ -1024,16 +1035,19 @@ def add_pronunciation_batch():
         if field_name not in note.keys():
             failed += 1
             continue
-        content = note[field_name]
-        existing_prons = find_existing_pronunciations(content)
+        content_before = note[field_name]
+        existing_prons = find_existing_pronunciations(content_before)
         if existing_prons:
             skipped += 1
             continue
-        detected_word = extract_word(content)
+        detected_word = extract_word(content_before)
         parent = mw.app.activeWindow() or mw
         dialog = PronDialog(parent, detected_word, existing_prons, note, field_name)
         dialog.exec()
-        if dialog.saved:
+        # closeEvent 自动保存，通过字段内容变化判断是否成功
+        card = mw.col.get_card(card_id)
+        note = card.note()
+        if note[field_name] != content_before:
             success += 1
         else:
             failed += 1
