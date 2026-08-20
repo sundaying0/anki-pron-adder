@@ -329,6 +329,7 @@ class PronDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("添加发音")
         self.setMinimumWidth(520)
+        self.setMinimumHeight(560)
         self.note = note
         self.field_name = field_name
         self.original_content = note[field_name]  # 备份原始内容
